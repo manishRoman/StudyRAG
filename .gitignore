@@ -1,0 +1,31 @@
+# Environment Variables (Never commit secrets!)
+.env
+*.env
+backend/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+studyrag_users.db
+users.db
+temp_*
+my_vector_db/
+
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
