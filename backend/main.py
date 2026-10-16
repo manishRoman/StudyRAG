@@ -1,5 +1,5 @@
 import os
-import fitz  # PyMuPDF
+import pymupdf
 import json
 import re
 import hashlib
@@ -10,7 +10,6 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone
 from google import genai
 from google.genai import types
@@ -129,17 +128,47 @@ except Exception as e:
     gemini_client = None
 
 try:
-    # 1. Initialize local embedding model (384 dimensions)
-    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-    # 2. Connect to Pinecone Cloud
+    # Connect to Pinecone Cloud
     pc = Pinecone(api_key=PINECONE_API_KEY)
     index = pc.Index(PINECONE_INDEX_NAME)
     print(f"Connected to Pinecone Index: {PINECONE_INDEX_NAME}")
 except Exception as e:
-    print(f"Error initializing Pinecone/Embeddings: {e}")
-    embed_model = None
+    print(f"Error initializing Pinecone: {e}")
     index = None
+
+# Cloud Embedding Helpers (Fast, 384 dimensions, zero local RAM usage)
+def get_embeddings(texts: list[str]) -> list[list[float]]:
+    if not texts or not gemini_client:
+        return []
+    all_embeddings = []
+    batch_size = 50
+    for i in range(0, len(texts), batch_size):
+        chunk = texts[i:i+batch_size]
+        res = gemini_client.models.embed_content(
+            model='gemini-embedding-001',
+            contents=chunk,
+            config=types.EmbedContentConfig(output_dimensionality=384)
+        )
+        if hasattr(res, 'embeddings') and res.embeddings:
+            for emb in res.embeddings:
+                all_embeddings.append(emb.values)
+        elif hasattr(res, 'embedding') and res.embedding:
+            all_embeddings.append(res.embedding.values)
+    return all_embeddings
+
+def get_single_embedding(text: str) -> list[float]:
+    if not text or not gemini_client:
+        return []
+    res = gemini_client.models.embed_content(
+        model='gemini-embedding-001',
+        contents=text,
+        config=types.EmbedContentConfig(output_dimensionality=384)
+    )
+    if hasattr(res, 'embedding') and res.embedding:
+        return res.embedding.values
+    elif hasattr(res, 'embeddings') and res.embeddings:
+        return res.embeddings[0].values
+    return []
 
 
 class AuthRequest(BaseModel):
@@ -307,15 +336,15 @@ def delete_document(filename: str):
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    if not index or not embed_model:
-        raise HTTPException(status_code=500, detail="Pinecone or Embedding model is not initialized.")
+    if not index or not gemini_client:
+        raise HTTPException(status_code=500, detail="Pinecone or Gemini is not initialized.")
 
     try:
         temp_path = f"temp_{file.filename}"
         with open(temp_path, "wb") as f:
             f.write(await file.read())
 
-        doc = fitz.open(temp_path)
+        doc = pymupdf.open(temp_path)
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
 
         all_chunks = []
@@ -345,8 +374,8 @@ async def upload_file(file: UploadFile = File(...)):
         if not all_chunks:
             return {"message": f"No readable text found in {file.filename}."}
 
-        # Generate 384-dim embeddings
-        embeddings = embed_model.encode(all_chunks).tolist()
+        # Generate 384-dim embeddings via Google Cloud API (zero local RAM!)
+        embeddings = get_embeddings(all_chunks)
 
         # Batch upsert into Pinecone (batches of 50)
         batch_size = 50
@@ -370,7 +399,7 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    if not index or not embed_model or not gemini_client:
+    if not index or not gemini_client:
         raise HTTPException(status_code=500, detail="Services not initialized properly.")
 
     try:
@@ -380,8 +409,8 @@ async def chat(request: ChatRequest):
             role = "User" if msg.get("role") == "user" else "Assistant"
             history_context += f"{role}: {msg.get('content')}\n"
 
-        # Embed query vector
-        query_vector = embed_model.encode(prompt).tolist()
+        # Embed query vector via Google Cloud API (384-dim, zero local RAM!)
+        query_vector = get_single_embedding(prompt)
 
         # Build filter if specific document selected
         query_filter = None
@@ -448,7 +477,7 @@ async def chat(request: ChatRequest):
 
 @app.get("/flashcards")
 async def get_flashcards(source: str = None):
-    if not index or not gemini_client or not embed_model:
+    if not index or not gemini_client:
         raise HTTPException(status_code=500, detail="Services not initialized.")
 
     try:
